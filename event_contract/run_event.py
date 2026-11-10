@@ -108,6 +108,39 @@ def predict(args: argparse.Namespace) -> None:
     tok = KronosTokenizer.from_pretrained(args.tokenizer).eval().to(device)
     model = Kronos.from_pretrained(args.model).eval().to(device)
     L, N, max_ctx, c = args.lookback, args.samples, 512, FEATURES.index("close")
+    chunk = args.decode_chunk
+
+    @torch.no_grad()
+    def _sample(xn: np.ndarray, st: np.ndarray) -> np.ndarray:
+        """对 B 个窗口各采样 N 个下一根 token 并解码，返回 [B, N, 2, 6]（重建的 bar t、预测的 bar t+1）。
+        B*N 行按 chunk 分块做 decode_s2 与 tokenizer 解码，显存只与 chunk 有关。"""
+        B = len(xn)
+        s1, s2 = tok.encode(torch.from_numpy(xn).to(device), half=True)
+        logits, ctx = model.decode_s1(s1, s2, torch.from_numpy(st).to(device))
+        pre = sample_from_logits(logits[:, -1, :].repeat_interleave(N, 0), temperature=args.T,
+                                 top_k=0, top_p=args.top_p, sample_logits=True)
+        owner = torch.arange(B, device=device).repeat_interleave(N)       # 第 r 行属于第 owner[r] 个窗口
+        out = []
+        for k in range(0, B * N, chunk):
+            rows, p1 = owner[k:k + chunk], pre[k:k + chunk]
+            s2_logits = model.decode_s2(ctx[rows], p1)[:, -1, :]
+            p2 = sample_from_logits(s2_logits, temperature=args.T, top_k=0, top_p=args.top_p, sample_logits=True)
+            f1 = torch.cat([s1[rows], p1], 1)[:, -max_ctx:]
+            f2 = torch.cat([s2[rows], p2], 1)[:, -max_ctx:]
+            out.append(tok.decode([f1, f2], half=True)[:, -2:, :].float().cpu())
+        return torch.cat(out).numpy().reshape(B, N, 2, 6)
+
+    def sample_next(xn: np.ndarray, st: np.ndarray) -> np.ndarray:
+        """显存不足时把窗口批次对半拆开重试。"""
+        try:
+            return _sample(xn, st)
+        except torch.OutOfMemoryError:
+            if len(xn) == 1:
+                raise
+            torch.cuda.empty_cache()
+            h = len(xn) // 2
+            print(f"  OOM at batch {len(xn)} → split", flush=True)
+            return np.concatenate([sample_next(xn[:h], st[:h]), sample_next(xn[h:], st[h:])])
 
     for symbol in args.symbols:
         for tf in args.tf:
@@ -132,17 +165,7 @@ def predict(args: argparse.Namespace) -> None:
                     mean, std = win.mean(1, keepdims=True), win.std(1, keepdims=True)
                     xn = np.clip((win - mean) / (std + 1e-5), -5, 5)
                     st = np.stack([stamp_all[j - L + 1:j + 1] for j in idx])
-                    with torch.no_grad():
-                        s1, s2 = tok.encode(torch.from_numpy(xn).to(device), half=True)
-                        logits, ctx = model.decode_s1(s1, s2, torch.from_numpy(st).to(device))
-                        pre = sample_from_logits(logits[:, -1, :].repeat_interleave(N, 0), temperature=args.T,
-                                                 top_k=0, top_p=args.top_p, sample_logits=True)
-                        s2_logits = model.decode_s2(ctx.repeat_interleave(N, 0), pre)[:, -1, :]
-                        post = sample_from_logits(s2_logits, temperature=args.T, top_k=0, top_p=args.top_p,
-                                                  sample_logits=True)
-                        f1 = torch.cat([s1.repeat_interleave(N, 0), pre], 1)[:, -max_ctx:]
-                        f2 = torch.cat([s2.repeat_interleave(N, 0), post], 1)[:, -max_ctx:]
-                        z = tok.decode([f1, f2], half=True).float().cpu().numpy().reshape(B, N, -1, 6)
+                    z = sample_next(xn, st)
                     pc, recon = z[:, :, -1, c], z[:, :, -2, c]
                     pred_close = pc * (std[:, 0, c][:, None] + 1e-5) + mean[:, 0, c][:, None]
                     last_close = win[:, -1, c][:, None]
@@ -153,6 +176,9 @@ def predict(args: argparse.Namespace) -> None:
                               "pred_ret_std": float((pred_close[k] / last_close[k] - 1).std())}
                              for k, j in enumerate(idx)]
                 PRED_DIR.mkdir(parents=True, exist_ok=True)
+                if not rows:
+                    print(f"{symbol} {tf} {month:%Y-%m}: 无可预测 bar，跳过", flush=True)
+                    continue
                 pd.DataFrame(rows).set_index("open_time").to_parquet(out)
                 print(f"{symbol} {tf} {month:%Y-%m}: {len(rows)} preds, {time.time() - t0:.0f}s", flush=True)
 
@@ -240,7 +266,8 @@ def main() -> None:
     p.add_argument("--samples", type=int, default=32)
     p.add_argument("--T", type=float, default=1.0)
     p.add_argument("--top-p", type=float, default=0.9)
-    p.add_argument("--batch", type=int, default=16)
+    p.add_argument("--batch", type=int, default=32, help="每批窗口数（OOM 时自动对半）")
+    p.add_argument("--decode-chunk", type=int, default=256, help="每次解码的 窗口×样本 行数，显存不足就调小")
     p.add_argument("--stride", type=int, default=1, help="每隔几根 bar 预测一次（10min 太慢可设 2/3）")
     p.add_argument("--device", default=None, help="cuda / cpu；默认有 GPU 就用")
     p.add_argument("--seed", type=int, default=0)
